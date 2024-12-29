@@ -1,0 +1,7 @@
+package example:pong;
+
+/// Invoke a component with a `ping` function
+interface pingpong {
+    /// Call ping, get a pong back
+    ping: func(input: string) -> string;
+}

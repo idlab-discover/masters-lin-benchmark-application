@@ -1,0 +1,6 @@
+package example:pong;
+
+world pong {
+
+  export pingpong;
+}

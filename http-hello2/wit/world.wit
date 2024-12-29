@@ -1,0 +1,8 @@
+package wasmcloud:hello;
+
+world hello {
+  import example:pong/pingpong;
+  import wasi:clocks/monotonic-clock@0.2.0; 
+  
+  export wasi:http/incoming-handler@0.2.0;
+}
