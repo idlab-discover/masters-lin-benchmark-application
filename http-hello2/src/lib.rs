@@ -17,37 +17,47 @@ const MAX_READ_BYTES: u32 = 2048;
 /// Maximum bytes to write at a time, due to the limitations on wasi-io's blocking_write_and_flush()
 const MAX_WRITE_BYTES: usize = 4096;
 
-// Pre-allocate a large buffer to ensure same startup memory usage
-const MAX_SIZE: usize = 1_000;
+const MAX_SIZE: usize = 10_000;
 static DUMMY_BUFFER: [u8; MAX_SIZE] = [0; MAX_SIZE];
 
 impl Guest for HttpServer {
-    fn handle(_request: IncomingRequest, response_out: ResponseOutparam) { //request not needed
-        // 1) Attempt to read the EFFECTIVE_SIZE env var. Return 400 if missing or invalid.
-        let requested_size = match get_effective_size() {
-            Ok(s) => s,
-            Err(msg) => {
-                eprintln!("DEBUG: get_effective_size() => Err({msg})");
-                return http_error(response_out, 400, &msg);
+    fn handle(request: IncomingRequest, response_out: ResponseOutparam) { //request not needed
+        // 2) Parse the request body for "size=..."
+        let raw_body = match request.read_body() {
+            Ok(b) => b,
+            Err(_) => {
+                let err = OutgoingResponse::new(Fields::new());
+                err.set_status_code(400).unwrap();
+                err.send_body(b"Failed to read request body").unwrap();
+                ResponseOutparam::set(response_out, Ok(err));
+                return;
             }
         };
 
-        eprintln!("DEBUG: requested_size = {requested_size}, MAX_SIZE = {MAX_SIZE}");
+        let body_str = String::from_utf8_lossy(&raw_body);
+        let requested_size = match parse_size(&body_str) {
+            Ok(s) => s,
+            Err(e) => {
+                let err = OutgoingResponse::new(Fields::new());
+                err.set_status_code(400).unwrap();
+                err.send_body(e.as_bytes()).unwrap();
+                ResponseOutparam::set(response_out, Ok(err));
+                return;
+            }
+        };
 
-        // 2) If requested_size > MAX_SIZE, return a 400 with explanation
         if requested_size > MAX_SIZE {
-            eprintln!("DEBUG: requested_size > MAX_SIZE => 400 error.");
-            let msg = format!("Requested size={requested_size} exceeds MAX_SIZE={MAX_SIZE}");
-            return http_error(response_out, 400, &msg);
+            let err = OutgoingResponse::new(Fields::new());
+            err.set_status_code(400).unwrap();
+            let msg = format!("Requested size {requested_size} > MAX_SIZE {MAX_SIZE}");
+            err.send_body(msg.as_bytes()).unwrap();
+            ResponseOutparam::set(response_out, Ok(err));
+            return;
         }
 
-        // 3) Slice the static buffer and convert to a string
+        // 4) Slice the big static buffer
         let payload_slice = &DUMMY_BUFFER[..requested_size];
         let payload = String::from_utf8_lossy(payload_slice);
-
-        eprintln!("DEBUG: Sliced buffer of size {requested_size}, continuing with 200 OK.");
-
-
 
 
         // let start_timestamp = SystemTime::now()
@@ -71,7 +81,6 @@ impl Guest for HttpServer {
         let response = OutgoingResponse::new(Fields::new());
         response.set_status_code(200).unwrap(); 
         
-       // Prepare the response text
         let response_text = format!(
             "Hello! I got pong {pong}\n\
              Start timestamp: {start_time}\n\
@@ -79,61 +88,27 @@ impl Guest for HttpServer {
              Elapsed time(ns): {elapsed_time_ns}\n"
         );
 
-        // Use the `send_body` method, which writes + finishes automatically
         response
             .send_body(response_text.as_bytes())
             .expect("failed to send response body");
 
-        // Return the final response to the caller
         ResponseOutparam::set(response_out, Ok(response));
     }
 }
 
-//----------------------------------
-// Env var reading function
-//----------------------------------
-fn get_effective_size() -> std::result::Result<usize, String> {
-    // We want *no default*, so we error out if it's missing
-    let var_result = std::env::var("EFFECTIVE_SIZE");
-    eprintln!("DEBUG: Attempting to read env var EFFECTIVE_SIZE => {:?}", var_result);
-
-    match var_result {
-        // If present, parse it
-        Ok(s) => match s.parse::<usize>() {
-            Ok(val) => {
-                eprintln!("DEBUG: Parsed EFFECTIVE_SIZE={val}");
-                Ok(val)
-            }
-            Err(e) => {
-                let msg = format!("Invalid integer in EFFECTIVE_SIZE='{s}': {e}");
-                eprintln!("DEBUG: {msg}");
-                Err(msg)
-            }
-        },
-        // If missing, that's an error
-        Err(e) => {
-            let msg = format!(
-                "EFFECTIVE_SIZE is missing in environment: {e}.\n\
-                 Please set EFFECTIVE_SIZE before running the actor."
-            );
-            eprintln!("DEBUG: {msg}");
-            Err(msg)
+/// Expect the body to contain e.g. "size=2000000".
+fn parse_size(body_str: &str) -> std::result::Result<usize, String> {
+    if let Some(idx) = body_str.find("size=") {
+        let after = &body_str[idx+5..];
+        let trimmed = after.trim();
+        match trimmed.parse::<usize>() {
+            Ok(v) => Ok(v),
+            Err(e) => Err(format!("Failed to parse integer after size=, got '{trimmed}': {e}")),
         }
+    } else {
+        Err(format!("Body must contain 'size=...' but got '{body_str}'"))
     }
 }
-
-//----------------------------------
-// Simple helper for 4xx responses
-//----------------------------------
-fn http_error(response_out: ResponseOutparam, code: u16, msg: &str) {
-    let err_resp = OutgoingResponse::new(Fields::new());
-    err_resp.set_status_code(code).unwrap();
-    // We don't want to panic if sending body fails, so we ignore any error
-    let _ = err_resp.send_body(msg.as_bytes());
-    ResponseOutparam::set(response_out, Ok(err_resp));
-}
-
-
 
 // NOTE: Since wit-bindgen makes `IncomingRequest` available to us as a local type,
 // we can add convenience functions to it
