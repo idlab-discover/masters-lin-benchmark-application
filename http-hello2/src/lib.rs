@@ -6,6 +6,7 @@ use wasi::http::types::*;
 use wasi::clocks::monotonic_clock;
 use wasi::io::streams::StreamError;
 use anyhow::{anyhow, bail, ensure, Result};
+use once_cell::sync::OnceCell;
 
 struct HttpServer;
 
@@ -17,67 +18,127 @@ const MAX_READ_BYTES: u32 = 2048;
 /// Maximum bytes to write at a time, due to the limitations on wasi-io's blocking_write_and_flush()
 const MAX_WRITE_BYTES: usize = 4096;
 
+// The value is derived from th error message: "failed to compile component: memory index 0 has a minimum byte size of 2001076224 which exceeds the limit of 268435456 bytes"
+const MAX_SIZE: usize = 240_000_000;
+static mut DUMMY_BUFFER: [u8; MAX_SIZE] = [0; MAX_SIZE];
+
+/// A one-time flag so we only fill the buffer once
+static INIT: OnceCell<()> = OnceCell::new();
 
 impl Guest for HttpServer {
-    fn handle(request: IncomingRequest, response_out: ResponseOutparam) { //request not needed
-        //let payload = "This is a test payload".to_string();
-        // Read the request body bytes into memory
-        //
-        // NOTE: this implementation cannot handle requests larger than memory,
-        // remember that but `wasi:http` is equipped with streams
-        // so you can modify this example to work with a request body of *any* size!
-        let body_bytes = request
-            .read_body()
-            .expect("failed to read request body into memory");
+    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
+        init_dummy_buffer();
+        // Extract "/?size=NNN" from path_with_query(), or return 400 if absent
+        let path_query = match request.path_with_query() {
+            Some(p) => p,
+            None => {
+                let err_resp = error_response(400, "No query string found. Try /?size=NNN");
+                ResponseOutparam::set(response_out, Ok(err_resp));
+                return;
+            }
+        };
 
-        // onvert the raw bytes into a UTF-8 string
-        let payload = String::from_utf8_lossy(&body_bytes).to_string();
+        // Split on '=' and expect something like ["/?size", "12345"]
+        // If the pattern doesn't match, return 400
+        let parts = path_query.split('=').collect::<Vec<&str>>();
+        let requested_size = match parts[..] {
+            ["/?size", size_str] => {
+                // Attempt to parse the size as usize
+                match size_str.trim().parse::<usize>() {
+                    Ok(val) => val,
+                    Err(e) => {
+                        let msg = format!("Failed to parse integer after size=, got '{size_str}': {e}");
+                        let err_resp = error_response(400, &msg);
+                        ResponseOutparam::set(response_out, Ok(err_resp));
+                        return;
+                    }
+                }
+            }
+            _ => {
+                // If we don't get exactly ["/?size", something], raise error
+                let err_resp = error_response(
+                    400,
+                    &format!("Query must be /?size=NNN, got '{path_query}'"),
+                );
+                ResponseOutparam::set(response_out, Ok(err_resp));
+                return;
+            }
+        };
 
-        // let start_timestamp = SystemTime::now()
-        //     .duration_since(UNIX_EPOCH)
-        //     .expect("Time went backwards")
-        //     .as_micros();
+        if requested_size > MAX_SIZE {
+            let msg = format!("Requested size {requested_size} > MAX_SIZE {MAX_SIZE}");
+            let err_resp = error_response(400, &msg);
+            ResponseOutparam::set(response_out, Ok(err_resp));
+            return;
+        }
+
+        // Do something with the buffer to avoid buffer being optimized away, but do NOT pass it to ping
+
+        let slice = unsafe { &DUMMY_BUFFER[..requested_size] };
+        let sum = slice.iter().fold(0_u64, |acc, &b| acc + b as u64);
+
+        // let payload = String::from_utf8_lossy(slice);
+        
+        // Minimally pass a tiny string to ping
+        let payload = "";
+
         let start_time = monotonic_clock::now();
-
-        let pong = example::pong::pingpong::ping(&payload);
-        
+        let pong = example::pong::pingpong::ping(payload);
         let end_time = monotonic_clock::now();
-
-        // Calculate elapsed time in nanoseconds
         let elapsed_time_ns = end_time - start_time;
-        
-        // let end_timestamp = SystemTime::now()
-        //     .duration_since(UNIX_EPOCH)
-        //     .expect("Time went backwards")
-        //     .as_micros();
-            
+
         let response = OutgoingResponse::new(Fields::new());
-        response.set_status_code(200).unwrap(); 
-        
-       // Prepare the response text
+        response.set_status_code(200).unwrap();
+
         let response_text = format!(
-            "Hello! I got pong {pong}\n\
+            "Hello! I got pong={pong}\n\
+             Requested size: {requested_size}\n\
+             Sum of entire buffer: {sum}\n\
              Start timestamp: {start_time}\n\
              End timestamp: {end_time}\n\
-             Elapsed time(ns): {elapsed_time_ns}\n"
+             Elapsed time (ns): {elapsed_time_ns}\n"
         );
-
-        // Use the `send_body` method, which writes + finishes automatically
         response
             .send_body(response_text.as_bytes())
             .expect("failed to send response body");
 
-        // Return the final response to the caller
         ResponseOutparam::set(response_out, Ok(response));
     }
 }
 
+/// Initialize the DUMMY_BUFFER once with non-zero data
+/// This approach ensures the memory is actually allocated and each byte is touched
+fn init_dummy_buffer() {
+    // If we've already done this, do nothing
+    if INIT.get().is_some() {
+        return;
+    }
 
-// NOTE: Since wit-bindgen makes `IncomingRequest` available to us as a local type,
+    INIT.get_or_init(|| {
+        unsafe {
+            for i in 0..MAX_SIZE {
+                // A simple filler: store i % 256
+                // (a real RNG might require WASI random APIs)
+                DUMMY_BUFFER[i] = (i & 0xFF) as u8;
+            }
+        }
+    });
+}
+
+fn error_response(status_code: u16, msg: &str) -> OutgoingResponse {
+    let err_resp = OutgoingResponse::new(Fields::new());
+    err_resp.set_status_code(status_code).unwrap();
+    err_resp
+        .send_body(msg.as_bytes())
+        .expect("failed to send error response");
+    err_resp
+}
+
+// NOTE: Since wit-bindgen makes IncomingRequest available to us as a local type,
 // we can add convenience functions to it
 impl IncomingRequest {
     /// This is a convenience function that writes out the body of a IncomingRequest (from wasi:http)
-    /// into anything that supports [`std::io::Write`]
+    /// into anything that supports [std::io::Write]
     fn read_body(self) -> Result<Vec<u8>> {
         // Read the body
         let incoming_req_body = self
@@ -108,11 +169,11 @@ impl IncomingRequest {
     }
 }
 
-// NOTE: Since wit-bindgen makes `OutgoingBody` available to us as a local type,
+// NOTE: Since wit-bindgen makes OutgoingBody available to us as a local type,
 // we can add convenience functions to it
 impl OutgoingResponse {
     /// This is a convenience function that writes out the body of a IncomingRequest (from wasi:http)
-    /// into anything that supports [`std::io::Read`]
+    /// into anything that supports [std::io::Read]
     fn send_body(&self, buf: &[u8]) -> Result<()> {
         let body = self.body().expect("failed to open outgoing response body");
         let out = body
@@ -129,3 +190,5 @@ impl OutgoingResponse {
 }
 
 export!(HttpServer);
+
+

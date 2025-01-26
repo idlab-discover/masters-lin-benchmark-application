@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 [dependencies]
 wit-bindgen = "0.32"
 anyhow = "1"
+once_cell = "1.17"
