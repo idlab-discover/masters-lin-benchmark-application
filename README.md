@@ -27,7 +27,7 @@ Ensure you have `wac` installed and run this command from the root directory of 
 ## Known Issues
 
 - [wasmCloud issue #4004](https://github.com/wasmCloud/wasmCloud/issues/4004): The wasmCloud host/HTTP server provider cannot parse sequential request bodies correctly. As a workaround, the payload size is hardcoded in the benchmarking component.
-- [wasm-tools bug](https://github.com/bytecodealliance/wasm-tools/pull/1999): Build-time composition with `wac` may fail on some v0.2.0 interfaces when used with older host/capability providers.
+- [wasm-tools bug](https://github.com/bytecodealliance/wasm-tools/pull/1999)/[wasmtime-wasi failure](https://github.com/bytecodealliance/wasmtime/issues/10184): After updating wit-parser to solve the issue, some v0.2.0 interfaces may fall.
 
 ## Reference
 
